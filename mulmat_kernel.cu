@@ -1,73 +1,80 @@
 ////////////////////////////////////////////////////////////////////////////////
-// simpleMultiply kernel
+// Matrix multiplication CUDA kernels
 ////////////////////////////////////////////////////////////////////////////////
 
-__global__ void simpleMultiply (double *a, double* b, double *c,int n)
+#include <cuda_runtime.h>
+
+__global__ void simpleMultiply(double *a, double *b, double *c, int n)
 {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (row < n && col < n)
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < n && col < n) 
     {
-    	double sum = 0.0;
+        double sum = 0.0;
 
-    	for (int i = 0; i < n; i++)
-        	sum += a[row * n + i] * b[i * n + col];
+        for (int i = 0; i < n; ++i)
+            sum += a[row * n + i] * b[i * n + col];
 
-    	c[row * n + col] = sum;
-  	}
-
+        c[row * n + col] = sum;
+    }
 }
 
-////////////////////////////////////////////////////
-//  sharedABMultiply kernel
-///////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+// Tiled matrix multiplication kernel
+////////////////////////////////////////////////////////////////////////////////
 
-__global__ void sharedABMultiply (double *a, double* b, double *c, int m, int n, int k, int lda, int ldb, int ldc, int w)
+__global__ void sharedABMultiply(double *a, double *b, double *c, int m, int n, int k, int lda, int ldb, int ldc, int w)
 {
-	extern __shared__ char shared_memory_space[];
-	double *aTile = (double *) shared_memory_space;
-	double *bTile = (double *) &(shared_memory_space[w * w * sizeof(double)]);
+    extern __shared__ char shared_memory_space[];
 
-	int row = blockIdx.y * blockDim.y + threadIdx.y;
-	int col = blockIdx.x * blockDim.x + threadIdx.x;
-	
-	double sum = 0.0f;
-	int num_tiles = k/w;
-	int tile,i;
-	
-	c[row * ldc + col] = 0.;
+    double *aTile = (double *)shared_memory_space;
+    double *bTile =
+        (double *)&shared_memory_space[w * w * sizeof(double)];
 
-	for (tile = 0; tile < num_tiles; tile++)
-	{
-		aTile[threadIdx.y * w + threadIdx.x] = a[row * lda  +	tile * w    	+	threadIdx.x];
-		bTile[threadIdx.y * w + threadIdx.x] = b[col		+	tile * w * ldb	+	threadIdx.y * ldb];
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-		__syncthreads();
+    double sum = 0.0;
 
-		sum=0.;
-		for (i = 0; i < w; i++)  
-			sum += aTile[threadIdx.y * w + i] * bTile[i * w + threadIdx.x];
+    const int num_tiles = (k + w - 1) / w;
+
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        const int a_col = tile * w + threadIdx.x;
+        const int b_row = tile * w + threadIdx.y;
+
+        if (row < m && a_col < k)
+            aTile[threadIdx.y * w + threadIdx.x] =
+                a[row * lda + a_col];
+        else
+            aTile[threadIdx.y * w + threadIdx.x] = 0.0;
+
+        if (b_row < k && col < n)
+            bTile[threadIdx.y * w + threadIdx.x] =
+                b[b_row * ldb + col];
+        else
+            bTile[threadIdx.y * w + threadIdx.x] = 0.0;
 
         __syncthreads();
 
-		c[row * ldc + col] += sum;
+        for (int i = 0; i < w; ++i)
+            sum += aTile[threadIdx.y * w + i] * bTile[i * w + threadIdx.x];
 
-	}
+        __syncthreads();
+    }
 
+    if (row < m && col < n)
+        c[row * ldc + col] = sum;
 }
 
-////////////////////////////////////////////////////
-//  ABMultiply kernel
-///////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+// ABMultiply wrapper
+////////////////////////////////////////////////////////////////////////////////
 
-void ABMultiply (double *a, double *b, double *c, int m, int n, int k,int lda, int ldb,int ldc, int w)
+void ABMultiply(double *a, double *b, double *c, int m, int n, int k, int lda, int ldb, int ldc, int w)
 {
-       dim3 grid(n/w, m/w);
-       dim3 block(w, w);
+    dim3 block(w, w);
+    dim3 grid((n + w - 1) / w, (m + w - 1) / w);
 
-       sharedABMultiply <<< grid, block,2 * w * w * sizeof(double) >>> (a, b, c, m, n, k, lda, ldb, ldc, w);
-
-       cudaDeviceSynchronize();
-
+    sharedABMultiply<<< grid, block, 2 * w * w * sizeof(double)>>>(a, b, c, m, n, k, lda, ldb, ldc, w);
 }

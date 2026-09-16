@@ -1,0 +1,38 @@
+mmb node=sdumont8046 MPI=0/4 NVSHMEM=0/4 device=0:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=1/4 NVSHMEM=1/4 device=1:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=2/4 NVSHMEM=2/4 device=2:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=3/4 NVSHMEM=3/4 device=3:Tesla V100-SXM2-32GB libraries=SSS
+
+
+mmb myRank=0	Libraries=SSS	 RESULT: Matrix size: 2048	Time (seconds):    0.003
+
+mmb node=sdumont8046 MPI=0/4 NVSHMEM=0/4 device=0:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=3/4 NVSHMEM=3/4 device=3:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=2/4 NVSHMEM=2/4 device=2:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=1/4 NVSHMEM=1/4 device=1:Tesla V100-SXM2-32GB libraries=SSS
+
+
+mmb myRank=0	Libraries=SSS	 RESULT: Matrix size: 4096	Time (seconds):    0.020
+
+mmb node=sdumont8046 MPI=1/4 NVSHMEM=1/4 device=1:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=2/4 NVSHMEM=2/4 device=2:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=3/4 NVSHMEM=3/4 device=3:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=0/4 NVSHMEM=0/4 device=0:Tesla V100-SXM2-32GB libraries=SSS
+
+
+mmb myRank=0	Libraries=SSS	 RESULT: Matrix size: 8192	Time (seconds):    0.143
+
+mmb node=sdumont8046 MPI=2/4 NVSHMEM=2/4 device=2:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=3/4 NVSHMEM=3/4 device=3:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=1/4 NVSHMEM=1/4 device=1:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=0/4 NVSHMEM=0/4 device=0:Tesla V100-SXM2-32GB libraries=SSS
+
+
+mmb myRank=0	Libraries=SSS	 RESULT: Matrix size: 16384	Time (seconds):    1.084
+
+mmb node=sdumont8046 MPI=1/4 NVSHMEM=1/4 device=1:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=0/4 NVSHMEM=0/4 device=0:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=2/4 NVSHMEM=2/4 device=2:Tesla V100-SXM2-32GB libraries=SSS
+mmb node=sdumont8046 MPI=3/4 NVSHMEM=3/4 device=3:Tesla V100-SXM2-32GB libraries=SSS
+
+mmb myRank=0	Libraries=SSS	 RESULT: Matrix size: 32768	Time (seconds):    8.672
