@@ -518,7 +518,7 @@ The main source files are:
 
 ```text
 .
-├── mmb_nvshmem.cu
+├── mmb.cu
 └── mulmat_kernel.cu
 ```
 
@@ -572,7 +572,7 @@ configures and launches the tiled CUDA kernel.
 The executable receives three arguments:
 
 ```text
-mmb_nvshmem <device_id> <matrix_size> <communication_configuration>
+mmb <device_id> <matrix_size> <communication_configuration>
 ```
 
 where:
@@ -586,7 +586,7 @@ where:
 For example:
 
 ```bash
-./mmb_nvshmem 0 8192 SNS
+./mmb 0 8192 SNS
 ```
 
 selects:
