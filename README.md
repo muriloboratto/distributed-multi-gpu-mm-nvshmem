@@ -813,7 +813,7 @@ The introduction of NVSHMEM makes this benchmark particularly useful for investi
 
 The benchmark can therefore support experiments involving:
 
-**Multi-GPU Communication · Data Movement · Data Locality · MPI · CUDA-Aware MPI · NCCL · NVSHMEM · PGAS · High-Performance Computing**
+**Multi-GPU Communication · Data Movement · Data Locality · MPI · CUDA-Aware MPI · NCCL · NVSHMEM · PGAS · High-Performance Computing**.
 
 ---
 
