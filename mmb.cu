@@ -12,8 +12,56 @@
 #include <nvshmemx.h>
 
 #define TILE_DIM 32
+#define DEFAULT_PIPELINE_K_CHUNK 2048
+
+static int pipeline_k_chunk_from_env(int k)
+{
+    int chunk = DEFAULT_PIPELINE_K_CHUNK;
+    const char *env = getenv("MM_PIPELINE_K_CHUNK");
+
+    if (env && *env) 
+    {
+        const int requested = atoi(env);
+        if (requested > 0)
+            chunk = requested;
+    }
+
+    if (chunk > k)
+        chunk = k;
+
+    if (chunk >= TILE_DIM)
+        chunk = (chunk / TILE_DIM) * TILE_DIM;
+
+    return (chunk > 0) ? chunk : k;
+}
+
+static void prefetch_B_chunk(double *dst,
+                             const double *s_B,
+                             int k_offset,
+                             int k_chunk,
+                             int n,
+                             int source_pe,
+                             int my_pe,
+                             cudaStream_t stream)
+{
+    const double *src = s_B + (size_t)k_offset * n;
+    const size_t count = (size_t)k_chunk * n;
+
+    if (my_pe == source_pe) 
+    {
+        cudaMemcpyAsync(dst, src, count * sizeof(double),cudaMemcpyDeviceToDevice, stream);
+    } else 
+    {
+        nvshmemx_double_get_nbi_on_stream(dst, src, count, source_pe, stream);
+        nvshmemx_quiet_on_stream(stream);
+    }
+}
 
 extern void ABMultiply(double *a, double *b, double *c, int m, int n, int k, int lda, int ldb, int ldc, int w);
+
+extern void ABMultiplyAccumulateAsync(const double *a, const double *b_chunk, double *c,
+                                      int m, int n, int k_total, int k_offset, int k_chunk,
+                                      int lda, int ldb, int ldc, int w, cudaStream_t stream);
 
 static int valid_library(char c)
 {
@@ -31,10 +79,10 @@ int main(int argc, char *argv[])
 
     if (argc < 4) 
     {
-        fprintf(stderr,
-                "Usage: %s <deviceId> <matrix_size> <ABC libraries>\n"
-                "  M=MPI, C=CUDA-Aware MPI, N=NCCL, S=NVSHMEM\n"
-                "  Example: %s 0 8192 SNS\n", argv[0], argv[0]);
+        fprintf(stderr,"Usage: %s <deviceId> <matrix_size> <ABC libraries>\n"
+                       "  M=MPI, C=CUDA-Aware MPI, N=NCCL, S=NVSHMEM\n"
+                       "  Example: %s 0 8192 SNS\n", argv[0], argv[0]);
+
         return EXIT_FAILURE;
     }
 
@@ -57,7 +105,7 @@ int main(int argc, char *argv[])
     {
         
         if (myRank == 0)
-            fprintf(stderr,"Invalid communication string. Use exactly 3 characters from M,C,N,S.\n");
+            fprintf(stderr,"Invalid communication string. Use exactly 3 characters from M, C, N, S.\n");
         
         MPI_Finalize();
         return EXIT_FAILURE;
@@ -143,6 +191,10 @@ int main(int argc, char *argv[])
     const int k  = matrix_size;
     const int w  = TILE_DIM;
     const int mi = matrix_size / nRanks;
+    const int pipeline_k_chunk = pipeline_k_chunk_from_env(k);
+
+    if (myRank == 0 && libB == 'S')
+        printf("mmb NVSHMEM overlap: double buffering, K-chunk=%d, asynchronous GET/quiet on stream\n", pipeline_k_chunk);
 
     const size_t bytes_A  = (size_t)m  * k * sizeof(double);
     const size_t bytes_B  = (size_t)k  * n * sizeof(double);
@@ -256,6 +308,31 @@ int main(int argc, char *argv[])
     }
 
     /* ------------------------------------------------------------------ */
+    /* NVSHMEM B pipeline resources.                                      */
+    /* ------------------------------------------------------------------ */
+
+    double *b_stage[2] = {NULL, NULL};
+    cudaStream_t comm_stream = NULL, compute_stream = NULL;
+    cudaEvent_t b_ready[2] = {NULL, NULL};
+    cudaEvent_t compute_done[2] = {NULL, NULL};
+
+    if (libB == 'S')
+    {
+        const size_t stage_bytes = (size_t)pipeline_k_chunk * n * sizeof(double);
+
+        cudaMalloc((void **)&b_stage[0], stage_bytes);
+        cudaMalloc((void **)&b_stage[1], stage_bytes);
+        cudaStreamCreateWithFlags(&comm_stream, cudaStreamNonBlocking);
+        cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking);
+
+        for (int i = 0; i < 2; ++i) 
+        {
+            cudaEventCreateWithFlags(&b_ready[i], cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&compute_done[i], cudaEventDisableTiming);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
     /* Initial values: initialize only the storage selected by A and B.   */
     /* ------------------------------------------------------------------ */
 
@@ -356,8 +433,7 @@ int main(int argc, char *argv[])
                 break;
 
             case 'S':
-                if (myPE != 0)
-                    nvshmem_double_get(s_B, s_B, (size_t)k * n, 0);
+                /* Chunked transfer is performed below by the double-buffer pipeline. */
                 break;
         }
 
@@ -369,10 +445,63 @@ int main(int argc, char *argv[])
         double *kernel_B = (libB == 'S') ? s_B  : d_B;
         double *kernel_C = (libC == 'S') ? s_lC : d_lC;
 
-        ABMultiply(kernel_A, kernel_B, kernel_C, mi, n, k, k, n, n, w);
+        if (libB == 'S')
+        {
+            cudaMemsetAsync(kernel_C, 0, bytes_lC, compute_stream);
 
-        cudaGetLastError();
-        cudaDeviceSynchronize();
+            const int num_chunks = (k + pipeline_k_chunk - 1) / pipeline_k_chunk;
+            int buffer_used[2] = {0, 0};
+
+            const int first_k = (k < pipeline_k_chunk) ? k : pipeline_k_chunk;
+            
+            prefetch_B_chunk(b_stage[0], s_B, 0, first_k, n, 0, myPE, comm_stream);
+            
+            cudaEventRecord(b_ready[0], comm_stream);
+            
+            buffer_used[0] = 1;
+
+            for (int chunk = 0; chunk < num_chunks; ++chunk)
+            {
+                const int current  = chunk & 1;
+                const int k_offset = chunk * pipeline_k_chunk;
+                const int k_chunk  = ((k - k_offset) < pipeline_k_chunk) ? (k - k_offset) : pipeline_k_chunk;
+
+                cudaStreamWaitEvent(compute_stream, b_ready[current], 0);
+
+                ABMultiplyAccumulateAsync(kernel_A, b_stage[current], kernel_C,
+                                          mi, n, k, k_offset, k_chunk,
+                                          k, n, n, w, compute_stream);
+                
+                cudaEventRecord(compute_done[current], compute_stream);
+
+                const int next_chunk = chunk + 1;
+
+                if (next_chunk < num_chunks)
+                {
+                    const int next = 1 - current;
+                    const int next_offset = next_chunk * pipeline_k_chunk;
+                    const int next_k = ((k - next_offset) < pipeline_k_chunk)
+                                     ? (k - next_offset) : pipeline_k_chunk;
+
+                    if (buffer_used[next])
+                        cudaStreamWaitEvent(comm_stream, compute_done[next], 0);
+
+                    prefetch_B_chunk(b_stage[next], s_B, next_offset, next_k, n, 0, myPE, comm_stream);
+
+                    cudaEventRecord(b_ready[next], comm_stream);
+
+                    buffer_used[next] = 1;
+                }
+            }
+
+            cudaStreamSynchronize(compute_stream);
+        }
+        else
+        {
+            ABMultiply(kernel_A, kernel_B, kernel_C, mi, n, k, k, n, n, w);
+            cudaGetLastError();
+            cudaDeviceSynchronize();
+        }
 
         /* ================================================================ */
         /* C: collect partial results                                        */
@@ -424,6 +553,22 @@ int main(int argc, char *argv[])
     /* Cleanup: free only buffers that were actually allocated.           */
     /* ------------------------------------------------------------------ */
     
+    if (libB == 'S')
+    {
+        cudaStreamSynchronize(comm_stream);
+        cudaStreamSynchronize(compute_stream);
+        
+        for (int i = 0; i < 2; ++i) 
+        {
+            cudaEventDestroy(b_ready[i]);
+            cudaEventDestroy(compute_done[i]);
+            cudaFree(b_stage[i]);
+        }
+        
+        cudaStreamDestroy(comm_stream);
+        cudaStreamDestroy(compute_stream);
+    }
+
     if (d_A)  cudaFree(d_A);
     if (d_B)  cudaFree(d_B);
     if (d_C)  cudaFree(d_C);

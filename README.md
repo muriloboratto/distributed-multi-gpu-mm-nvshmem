@@ -2,23 +2,23 @@
 
 ![Scheme](img/1.png)
 
-Matrix **A** is partitioned by rows among the MPI processes/GPUs, while matrix **B** must be available to all GPUs.
+Matrix $A$ is partitioned by rows among the MPI processes/GPUs, while matrix $B$ must be available to all GPUs.
 
-Each process computes a local portion of matrix **C**:
+Each process computes a local portion of matrix $C$:
 
-$$
+$
 C_i = A_i \times B
-$$
+$
 
 where:
 
-* \($A_i$\) is the portion of matrix **A** assigned to process/GPU \(i\);
-* \($B$\) is the complete matrix **B**;
-* \($C_i$\) is the partial result computed by process/GPU \(i\).
+* \($A_i$\) is the portion of matrix $A$ assigned to $GPU_i$;
+* \($B$\) is the complete matrix $B$;
+* \($C_i$\) is the partial result computed by $GPU_i$.
 
 The partial matrices \($C_i$\) are then combined to obtain the complete result matrix:
 
-$$
+$
 C =
 \begin{bmatrix}
 C_0 \\
@@ -26,7 +26,7 @@ C_1 \\
 \vdots \\
 C_{P-1}
 \end{bmatrix}
-$$
+$
 
 where \($P$\) is the number of MPI processes, GPUs, and NVSHMEM Processing Elements (PEs).
 
@@ -57,9 +57,7 @@ MPI initializes and coordinates the distributed processes.
 NVSHMEM is initialized using the existing MPI communicator:
 
 ```cpp
-nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM,
-                   &attr
-);
+nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
 ```
 
 The implementation verifies that MPI ranks and NVSHMEM PEs have a consistent mapping:
@@ -156,25 +154,25 @@ The computation can be divided into three main communication stages.
 
 ### Stage 1 — Distribution of Matrix A
 
-Matrix **A** is partitioned among the GPUs.
+Matrix $A$ is partitioned among the GPUs.
 
 Each GPU receives only the rows required to calculate its corresponding portion of matrix **C**.
 
 ### Stage 2 — Distribution of Matrix B
 
-Matrix **B** must be available to every GPU participating in the computation.
+Matrix $B$ must be available to every GPU participating in the computation.
 
-Therefore, the complete matrix **B** is distributed to all participating processes/GPUs.
+Therefore, the complete matrix $B$ is distributed to all participating processes/GPUs.
 
 ### Stage 3 — Collection of Matrix C
 
 After each GPU computes its local matrix:
 
-$$
+$
 C_i = A_i \times B
-$$
+$
 
-the partial results are collected to construct the complete matrix **C**.
+the partial results are collected to construct the complete matrix $C$.
 
 ---
 
@@ -182,7 +180,7 @@ the partial results are collected to construct the complete matrix **C**.
 
 ### Matrix A
 
-The distribution of matrix **A** depends on the selected communication mechanism:
+The distribution of matrix $A$ depends on the selected communication mechanism:
 
 | Option | Operation                                                    |
 | ------ | ------------------------------------------------------------ |
@@ -191,14 +189,10 @@ The distribution of matrix **A** depends on the selected communication mechanism
 | `N`    | `ncclBroadcast` followed by selection of the local partition |
 | `S`    | `nvshmem_double_get` from PE 0                               |
 
-For NVSHMEM, each PE performs a one-sided read of its corresponding portion of matrix **A**:
+For NVSHMEM, each PE performs a one-sided read of its corresponding portion of matrix $A$:
 
 ```cpp
-nvshmem_double_get(s_lA, 
-                   s_A + (size_t)myPE * mi * k, 
-                   (size_t)mi * k, 
-                   0
-);
+nvshmem_double_get(s_lA,  s_A + (size_t)myPE * mi * k, (size_t)mi * k, 0);
 ```
 
 Therefore, each PE directly obtains its required block from the symmetric memory belonging to **PE 0**.
@@ -220,11 +214,7 @@ For NVSHMEM, every non-root PE retrieves the complete matrix **B** from PE 0:
 
 ```cpp
 if (myPE != 0)
-    nvshmem_double_get(s_B,
-                       s_B,
-                       (size_t)k * n,
-                       0
-    );
+    nvshmem_double_get(s_B, s_B, (size_t)k * n, 0);
 ```
 
 ---
@@ -247,11 +237,7 @@ if (myPE == 0)
 {
     for (int pe = 0; pe < nPEs; ++pe)
     {
-        nvshmem_double_get(s_C + (size_t)pe * mi * n,
-                           s_lC,
-                           (size_t)mi * n,
-                           pe
-        );
+        nvshmem_double_get(s_C + (size_t)pe * mi * n, s_lC, (size_t)mi * n, pe);
     }
 }
 ```
@@ -396,7 +382,7 @@ NVSHMEM synchronization is performed using:
 nvshmem_barrier_all();
 ```
 
-For example, after PE 0 initializes matrices **A** and **B**:
+For example, after PE 0 initializes matrices $A$ and $B$:
 
 ```cpp
 nvshmem_barrier_all();
@@ -722,9 +708,9 @@ The main purpose of this code is to evaluate the impact of **communication mecha
 
 Although the computational operation remains the same:
 
-$$
+$
 C_i = A_i \times B
-$$
+$
 
 the way data are moved between CPUs, GPUs, and remote nodes can significantly affect application performance.
 
@@ -852,3 +838,174 @@ The benchmark therefore provides a foundation for studying how:
 affect the execution time of a distributed multi-GPU application.
 
 ---
+
+## NVSHMEM double buffering and communication/computation overlap
+
+The NVSHMEM path for matrix **B** now uses a two-buffer pipeline instead of fetching the entire matrix before launching the GEMM. `B` is partitioned along the K dimension (`PIPELINE_K_CHUNK`, default 2048 rows). While the compute stream multiplies chunk *t*, the communication stream fetches chunk *t+1* from PE 0 with `nvshmemx_getmem_on_stream`. CUDA events protect buffer reuse and establish dependencies between the communication and compute streams. The output tile is initialized once and accumulated across K chunks by `ABMultiplyAccumulateAsync`.
+
+This optimization is active whenever the second communication selector is `S` (for example `SSS`, `MSM`, `CSN`). The chunk size can be tuned by changing `PIPELINE_K_CHUNK` in `mmb.cu` to balance transfer granularity, GPU memory usage, and kernel duration.
+
+---
+
+## Optimized NVSHMEM Double-Buffer Pipeline
+
+This version improves the NVSHMEM communication path by adopting an asynchronous
+**producer/consumer pipeline** based on **double buffering** and
+**communication/computation overlap**.
+
+The main objective is to reduce GPU idle time caused by data movement. Instead of
+waiting for the communication of a matrix block to finish before starting its
+computation, the implementation asynchronously prefetches the **next block of
+matrix B** while the GPU computes the **current block**.
+
+Therefore, communication and computation can progress concurrently.
+
+---
+
+### Synchronous Communication/Computation
+
+In a synchronous implementation, communication and computation are serialized.
+
+For each data block, the GPU must first wait for the required data to arrive and
+only then start the corresponding computation:
+
+```text
+                  time ─────────────────────────────────────────►
+
+GET data GPU 1    █████
+COMPUTE GPU 1          ███████████
+
+GET data GPU 2                     █████
+COMPUTE GPU 2                           ███████████
+
+GET data GPU 3                                      █████
+COMPUTE GPU 3                                            ███████████
+```
+
+Conceptually, the execution time behaves approximately as:
+
+
+$T_{\text{sync}}
+\approx
+T_{\text{communication}}
++
+T_{\text{computation}}$
+
+
+This execution model may leave the GPU idle while waiting for remote data.
+
+---
+
+### Asynchronous Double Buffering and Communication/Computation Overlap
+
+The optimized NVSHMEM implementation uses two GPU staging buffers for matrix
+**B**, referred to as **Buffer A** and **Buffer B**.
+
+The buffers operate in **ping-pong order**.
+
+While the compute stream processes the block currently stored in one buffer,
+the communication stream asynchronously fetches the next block into the other
+buffer.
+
+```text
+                  time ─────────────────────────────────────────►
+
+Buffer A: GET 0   ████
+Compute:               ███████████  owner 0
+
+Buffer B:               ████ GET 1
+                             ███████████  owner 1
+
+Buffer A:                    ████ GET 2
+                                  ███████████  owner 2
+
+Buffer B:                         ████ GET 3
+```
+
+The fundamental pipeline operation is therefore:
+
+```text
+                 CURRENT BLOCK             NEXT BLOCK
+                      │                         │
+                      ▼                         ▼
+               ┌─────────────┐          ┌─────────────┐
+               │  COMPUTE k  │          │   GET k+1   │
+               │             │    ||    │             │
+               └─────────────┘          └─────────────┘
+                        Communication/Computation
+                                Overlap
+```
+
+or, more compactly:
+
+```text
+comm_stream:         GET B0       GET B1       GET B2       GET B3
+                        │            │            │            │
+                        ▼            ▼            ▼            ▼
+
+compute_stream:       GEMM B0      GEMM B1      GEMM B2      GEMM B3
+                      ███████      ███████      ███████      ███████
+                         ↖ overlap ↗  ↖ overlap ↗  ↖ overlap ↗
+```
+
+Thus, after the initial pipeline startup, the execution follows the pattern:
+
+$\boxed{
+\text{Compute}(B_k)
+\parallel
+\text{Prefetch}(B_{k+1})
+}$
+
+
+---
+
+### Expected Performance Effect
+
+Without overlap:
+
+$T_{\text{sync}}
+\approx
+T_{\text{communication}}
++
+T_{\text{computation}}$
+
+
+With effective communication/computation overlap:
+
+$T_{\text{overlap}}
+\approx
+\max
+\left(
+T_{\text{communication}},
+T_{\text{computation}}
+\right)
++
+T_{\text{pipeline overhead}}$
+
+
+Therefore, part of the communication latency can be **hidden behind useful GPU
+computation**.
+
+Conceptually:
+
+```text
+Synchronous:
+
+COMMUNICATION       COMPUTATION
+████████████        █████████████████
+<----------- total execution ----------->
+
+
+Double Buffer + Overlap:
+
+COMMUNICATION
+████████████
+       COMPUTATION
+       █████████████████
+       <---- overlap ---->
+
+<------ shorter exposed execution ------>
+```
+
+---
+
