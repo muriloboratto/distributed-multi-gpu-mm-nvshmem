@@ -6,9 +6,9 @@ Matrix $A$ is partitioned by rows among the MPI processes/GPUs, while matrix $B$
 
 Each process computes a local portion of matrix $C$:
 
-$
+$$
 C_i = A_i \times B
-$
+$$
 
 where:
 
@@ -18,7 +18,7 @@ where:
 
 The partial matrices \($C_i$\) are then combined to obtain the complete result matrix:
 
-$
+$$
 C =
 \begin{bmatrix}
 C_0 \\
@@ -26,7 +26,7 @@ C_1 \\
 \vdots \\
 C_{P-1}
 \end{bmatrix}
-$
+$$
 
 where \($P$\) is the number of MPI processes, GPUs, and NVSHMEM Processing Elements (PEs).
 
