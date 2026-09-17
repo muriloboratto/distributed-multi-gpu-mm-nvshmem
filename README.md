@@ -168,9 +168,9 @@ Therefore, the complete matrix $B$ is distributed to all participating processes
 
 After each GPU computes its local matrix:
 
-$
+$$
 C_i = A_i \times B
-$
+$$
 
 the partial results are collected to construct the complete matrix $C$.
 
