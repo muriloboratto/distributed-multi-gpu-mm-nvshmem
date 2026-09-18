@@ -2,7 +2,7 @@
 
 ![Scheme](img/1.png)
 
-Matrix $A$ is partitioned by rows among the MPI processes/GPUs, while matrix $B$ must be available to all GPUs.
+Matrix $A$ is partitioned by rows across the MPI processes/GPUs, whereas matrix $B$ must be accessible to every GPU.
 
 Each process computes a local portion of matrix $C$:
 
@@ -68,13 +68,13 @@ MPI Rank i == NVSHMEM PE i
 
 NCCL is also initialized across the GPUs associated with the MPI ranks.
 
-This architecture allows the same GPU computational kernel to be evaluated with four different communication mechanisms.
+This architecture allows the same GPU computation kernel to be evaluated using four different communication mechanisms.
 
 ---
 
 ## 3. Communication Libraries
 
-The communication mechanism used for matrices **A**, **B**, and **C** can be independently selected using a three-character configuration string.
+The communication mechanism used for matrices **A**, **B**, and **C** can be selected independently through a three-character configuration string.
 
 The available options are:
 
@@ -122,7 +122,7 @@ SNC
 MSN
 ```
 
-This design makes it possible to evaluate different combinations of communication mechanisms without modifying the computational kernel.
+This design enables different combinations of communication mechanisms to be evaluated without modifying the computation kernel.
 
 ---
 
@@ -156,13 +156,13 @@ The computation can be divided into three main communication stages.
 
 Matrix $A$ is partitioned among the GPUs.
 
-Each GPU receives only the rows required to calculate its corresponding portion of matrix **C**.
+Each GPU receives only the rows required to compute its corresponding portion of matrix **C**.
 
 ### Stage 2 — Distribution of Matrix B
 
 Matrix $B$ must be available to every GPU participating in the computation.
 
-Therefore, the complete matrix $B$ is distributed to all participating processes/GPUs.
+Therefore, the complete matrix $B$ is made available to all participating processes/GPUs.
 
 ### Stage 3 — Collection of Matrix C
 
@@ -195,7 +195,7 @@ For NVSHMEM, each PE performs a one-sided read of its corresponding portion of m
 nvshmem_double_get(s_lA,  s_A + (size_t)myPE * mi * k, (size_t)mi * k, 0);
 ```
 
-Therefore, each PE directly obtains its required block from the symmetric memory belonging to **PE 0**.
+Thus, each PE directly retrieves its required block from the symmetric memory allocated on **PE 0**.
 
 ---
 
@@ -208,14 +208,21 @@ Matrix **B** must be available to all participating GPUs:
 | `M`    | `MPI_Bcast` using host memory         |
 | `C`    | `MPI_Bcast` directly using GPU memory |
 | `N`    | `ncclBroadcast`                       |
-| `S`    | `nvshmem_double_get` from PE 0        |
+| `S`    | Chunked asynchronous GETs from PE 0 using a double-buffer pipeline |
 
-For NVSHMEM, every non-root PE retrieves the complete matrix **B** from PE 0:
+For NVSHMEM, matrix **B** is not fetched as one blocking transfer. The current code partitions **B** along the K dimension and stages two chunks in ping-pong buffers. Remote PEs use `nvshmemx_double_get_nbi_on_stream()` followed by `nvshmemx_quiet_on_stream()`, while PE 0 uses a local asynchronous device-to-device copy:
 
 ```cpp
-if (myPE != 0)
-    nvshmem_double_get(s_B, s_B, (size_t)k * n, 0);
+if (my_pe == source_pe)
+    cudaMemcpyAsync(dst, src, count * sizeof(double),
+                    cudaMemcpyDeviceToDevice, stream);
+else {
+    nvshmemx_double_get_nbi_on_stream(dst, src, count, source_pe, stream);
+    nvshmemx_quiet_on_stream(stream);
+}
 ```
+
+This transfer is issued on `comm_stream` and overlapped with GEMM work on `compute_stream`.
 
 ---
 
@@ -242,7 +249,7 @@ if (myPE == 0)
 }
 ```
 
-The complete matrix **C** is therefore assembled in the symmetric memory of PE 0.
+The complete matrix **C** is therefore assembled in PE 0's symmetric memory.
 
 ---
 
@@ -285,7 +292,7 @@ PE 0 / GPU 0       PE 1 / GPU 1       PE 2 / GPU 2
                 communication
 ```
 
-The symmetric memory model allows a PE to directly access memory associated with another PE using NVSHMEM communication operations.
+The symmetric-memory model allows a PE to directly access memory associated with another PE through NVSHMEM communication operations.
 
 This differs from the traditional MPI two-sided communication model, where both sender and receiver participate explicitly in the communication operation.
 
@@ -293,13 +300,14 @@ This differs from the traditional MPI two-sided communication model, where both 
 
 ## 7. NVSHMEM Communication Model
 
-The NVSHMEM implementation primarily uses:
+The NVSHMEM implementation uses both blocking and stream-ordered one-sided operations. Matrix **A** and the final collection of **C** use `nvshmem_double_get()`. The pipelined path for matrix **B** uses:
 
 ```cpp
-nvshmem_double_get()
+nvshmemx_double_get_nbi_on_stream()
+nvshmemx_quiet_on_stream()
 ```
 
-This operation follows a **one-sided communication model**.
+These operations follow a **one-sided communication model**. The stream-ordered path additionally allows communication to progress concurrently with GPU computation.
 
 Conceptually:
 
@@ -327,7 +335,7 @@ PE 0                         PE 1
  |                            |
 ```
 
-The requesting PE initiates the transfer directly.
+The requesting PE initiates the data transfer directly.
 
 For matrix **A**:
 
@@ -347,7 +355,7 @@ For matrix **B**:
 ```text
 PE i
  |
- | nvshmem_double_get()
+ | asynchronous NVSHMEM GET
  v
 PE 0: s_B
  |
@@ -390,15 +398,17 @@ nvshmem_barrier_all();
 
 ensures that initialization is complete before other PEs attempt to retrieve the data.
 
-Synchronization is also performed after NVSHMEM communication operations where required by the current implementation.
-
-CUDA synchronization is performed using:
+Synchronization is also performed after NVSHMEM communication operations where required by the current implementation. For the pipelined **B** path, CUDA events express dependencies without globally synchronizing the device:
 
 ```cpp
-cudaDeviceSynchronize();
+cudaEventRecord(b_ready[i], comm_stream);
+cudaStreamWaitEvent(compute_stream, b_ready[i], 0);
+
+cudaEventRecord(compute_done[i], compute_stream);
+cudaStreamWaitEvent(comm_stream, compute_done[i], 0);
 ```
 
-and NCCL operations are synchronized through:
+The non-pipelined CUDA path uses `cudaDeviceSynchronize()`, while the optimized NVSHMEM path synchronizes `compute_stream` after the last chunk. NCCL operations are synchronized through:
 
 ```cpp
 cudaStreamSynchronize(s);
@@ -422,7 +432,7 @@ mulmat_kernel.cu
 
 The CUDA implementation uses **tiled matrix multiplication**.
 
-Tiles from matrices **A** and **B** are loaded into GPU shared memory and multiplied to calculate the corresponding tile of matrix **C**.
+Tiles from matrices **A** and **B** are loaded into GPU shared memory and multiplied to compute the corresponding tile of matrix **C**.
 
 Conceptually:
 
@@ -471,27 +481,17 @@ The same CUDA matrix multiplication kernel is used regardless of the selected co
 The input and output buffers are dynamically selected according to the configuration:
 
 ```cpp
-double *kernel_A = (communication_libraries[0] == 'S') ? s_lA : d_lA;
-
-double *kernel_B = (communication_libraries[1] == 'S') ? s_B : d_B;
-
-double *kernel_C = (communication_libraries[2] == 'S') ? s_lC : d_lC;
+double *kernel_A = (libA == 'S') ? s_lA : d_lA;
+double *kernel_B = (libB == 'S') ? s_B  : d_B;
+double *kernel_C = (libC == 'S') ? s_lC : d_lC;
 ```
 
-The multiplication is then executed as:
+For `libB != 'S'`, the multiplication is executed by the regular tiled kernel through `ABMultiply()`. For `libB == 'S'`, `kernel_B` is not consumed directly by the GEMM; instead, chunks from symmetric `s_B` are prefetched into `b_stage[0]` and `b_stage[1]`, and each chunk is accumulated into `kernel_C` with:
 
 ```cpp
-ABMultiply(kernel_A,
-           kernel_B,
-           kernel_C,
-           mi, 
-           n, 
-           k,
-           lda, 
-           ldb, 
-           ldc,
-           w
-);
+ABMultiplyAccumulateAsync(kernel_A, b_stage[current], kernel_C,
+                          mi, n, k, k_offset, k_chunk,
+                          k, n, n, w, compute_stream);
 ```
 
 
@@ -505,10 +505,16 @@ The main source files are:
 ```text
 .
 ├── mmb.cu
-└── mulmat_kernel.cu
+├── mulmat_kernel.cu
+├── makefile
+├── img/
+└── experimental-results/
+    ├── script-execution-1node-4GPUs.sh
+    ├── plot.py
+    └── result--*.txt
 ```
 
-### `mmb_nvshmem.cu`
+### `mmb.cu`
 
 Implements:
 
@@ -527,6 +533,8 @@ Implements:
 * invocation of the CUDA matrix multiplication kernel;
 * collection of matrix C;
 * execution-time measurement;
+* double-buffer allocation for the NVSHMEM **B** pipeline;
+* asynchronous communication/computation overlap;
 * resource cleanup.
 
 ### `mulmat_kernel.cu`
@@ -543,19 +551,13 @@ and the tiled shared-memory kernel:
 sharedABMultiply()
 ```
 
-The function:
-
-```cpp
-ABMultiply()
-```
-
-configures and launches the tiled CUDA kernel.
+The function `ABMultiply()` configures and launches the standard tiled CUDA kernel. The optimized NVSHMEM path additionally uses `sharedABMultiplyAccumulate()` and `ABMultiplyAccumulateAsync()` to accumulate partial products from successive K chunks on `compute_stream`.
 
 ---
 
 ## 12. Command-Line Arguments
 
-The executable receives three arguments:
+The executable accepts three command-line arguments:
 
 ```text
 mmb <device_id> <matrix_size> <communication_configuration>
@@ -659,11 +661,26 @@ B -> NCCL
 C -> NVSHMEM
 ```
 
-This approach allows communication strategies to be mixed independently for each matrix.
+This approach allows the communication strategy for each matrix to be selected independently.
 
 ---
 
-## 14. Performance Measurement
+## 14. Build Configuration
+
+The `makefile` obtains CUDA, NVSHMEM, and NCCL installation paths from the environment:
+
+```bash
+export CUDA_HOME=/path/to/cuda
+export NVSHMEM_HOME=/path/to/nvshmem
+export NCCL_HOME=/path/to/nccl
+make
+```
+
+The current build targets NVIDIA Volta (`sm_70`) and uses relocatable device code (`-rdc=true`), which is required by the NVSHMEM device-linking path. The executable generated is `mmb`.
+
+---
+
+## 15. Performance Measurement
 
 The execution time is measured using:
 
@@ -671,7 +688,7 @@ The execution time is measured using:
 MPI_Wtime()
 ```
 
-The benchmark executes the multiplication multiple times:
+The benchmark performs the matrix multiplication multiple times:
 
 ```cpp
 const int loop_count = 10;
@@ -685,7 +702,7 @@ elapsed_time = stop_time - start_time;
 double avg_time = elapsed_time / (double)loop_count;
 ```
 
-This enables comparisons among configurations such as:
+This enables direct comparisons among configurations such as:
 
 ```text
 MMM
@@ -702,9 +719,9 @@ for the same computational workload and matrix size.
 
 ---
 
-## 14. Benchmarking Purpose
+## 16. Benchmarking Purpose
 
-The main purpose of this code is to evaluate the impact of **communication mechanisms and data movement** on distributed multi-GPU matrix multiplication.
+The primary purpose of this code is to evaluate the impact of **communication mechanisms and data movement** on distributed multi-GPU matrix multiplication.
 
 Although the computational operation remains the same:
 
@@ -712,7 +729,7 @@ $
 C_i = A_i \times B
 $
 
-the way data are moved between CPUs, GPUs, and remote nodes can significantly affect application performance.
+the way data move among CPUs, GPUs, and remote nodes can significantly affect application performance.
 
 The benchmark can therefore be used to investigate:
 
@@ -732,7 +749,7 @@ The benchmark can therefore be used to investigate:
 
 ---
 
-## 15. MPI vs CUDA-Aware MPI vs NCCL vs NVSHMEM
+## 17. MPI vs CUDA-Aware MPI vs NCCL vs NVSHMEM
 
 The benchmark provides a common computational workload for comparing four communication models:
 
@@ -769,15 +786,15 @@ The benchmark provides a common computational workload for comparing four commun
           +-----------------------------------+
 ```
 
-This provides a controlled environment for investigating how different programming and communication models influence multi-GPU application performance.
+This benchmark provides a controlled environment for investigating how different programming and communication models affect multi-GPU application performance.
 
 ---
 
-## 16. Research Context
+## 18. Research Context
 
 Modern GPUs provide extremely high computational throughput.
 
-As GPU performance increases, however, application performance increasingly depends on:
+As GPU performance increases, however, overall application performance becomes increasingly dependent on:
 
 ```text
 Where are the data?
@@ -803,7 +820,7 @@ The benchmark can therefore support experiments involving:
 
 ---
 
-## 17. Data Locality Perspective
+## 19. Data Locality Perspective
 
 The communication configuration can also be interpreted from a **Data Locality** perspective.
 
@@ -827,7 +844,7 @@ GPU on Remote Node
 
 Different communication libraries may use these paths differently.
 
-The benchmark therefore provides a foundation for studying how:
+The benchmark therefore provides a foundation for investigating how:
 
 * data placement;
 * communication mechanism;
@@ -839,35 +856,42 @@ affect the execution time of a distributed multi-GPU application.
 
 ---
 
-## NVSHMEM double buffering and communication/computation overlap
+## 20. NVSHMEM Double Buffering and Communication/Computation Overlap
 
 The NVSHMEM path for matrix **B** now uses a two-buffer pipeline instead of fetching the entire matrix before launching the GEMM. `B` is partitioned along the K dimension (`PIPELINE_K_CHUNK`, default 2048 rows). While the compute stream multiplies chunk *t*, the communication stream fetches chunk *t+1* from PE 0 with `nvshmemx_getmem_on_stream`. CUDA events protect buffer reuse and establish dependencies between the communication and compute streams. The output tile is initialized once and accumulated across K chunks by `ABMultiplyAccumulateAsync`.
 
-This optimization is active whenever the second communication selector is `S` (for example `SSS`, `MSM`, `CSN`). The chunk size can be tuned by changing `PIPELINE_K_CHUNK` in `mmb.cu` to balance transfer granularity, GPU memory usage, and kernel duration.
+This optimization is enabled whenever the second communication selector is `S` (for example, `SSS`, `MSM`, or `CSN`). The default chunk size is `2048` rows (`DEFAULT_PIPELINE_K_CHUNK`). It can be tuned at runtime with the `MM_PIPELINE_K_CHUNK` environment variable, without recompiling:
+
+```bash
+export MM_PIPELINE_K_CHUNK=2048
+mpirun -np 1 ./mmb 0 2048 SSS : -np 1 ./mmb 1 2048 SSS : -np 1 ./mmb 2 2048 SSS : -np 1 ./mmb 3 2048 SSS
+```
+
+The requested value is capped at `k` and, whenever possible, rounded down to a multiple of `TILE_DIM` (`32`). This parameter makes it possible to experimentally evaluate the trade-offs among transfer granularity, staging-buffer memory usage, and kernel execution time.
 
 ---
 
-## Optimized NVSHMEM Double-Buffer Pipeline
+### Optimized Producer/Consumer Pipeline
 
-This version improves the NVSHMEM communication path by adopting an asynchronous
+This version improves the NVSHMEM communication path by introducing an asynchronous
 **producer/consumer pipeline** based on **double buffering** and
 **communication/computation overlap**.
 
-The main objective is to reduce GPU idle time caused by data movement. Instead of
-waiting for the communication of a matrix block to finish before starting its
+The primary objective is to reduce GPU idle time caused by data movement. Rather than
+waiting for the transfer of a matrix block to complete before starting the corresponding
 computation, the implementation asynchronously prefetches the **next block of
-matrix B** while the GPU computes the **current block**.
+matrix B** while the GPU processes the **current block**.
 
-Therefore, communication and computation can progress concurrently.
+As a result, communication and computation can progress concurrently.
 
 ---
 
-### Synchronous Communication/Computation
+#### Synchronous Communication/Computation
 
 In a synchronous implementation, communication and computation are serialized.
 
-For each data block, the GPU must first wait for the required data to arrive and
-only then start the corresponding computation:
+For each data block, the GPU must first wait for the required data to arrive before
+starting the corresponding computation:
 
 ```text
                   time ─────────────────────────────────────────►
@@ -892,20 +916,19 @@ T_{\text{communication}}
 T_{\text{computation}}$
 
 
-This execution model may leave the GPU idle while waiting for remote data.
+This execution model can leave the GPU idle while it waits for remote data.
 
 ---
 
-### Asynchronous Double Buffering and Communication/Computation Overlap
+#### Asynchronous Double Buffering and Communication/Computation Overlap
 
 The optimized NVSHMEM implementation uses two GPU staging buffers for matrix
 **B**, referred to as **Buffer A** and **Buffer B**.
 
-The buffers operate in **ping-pong order**.
+The buffers alternate in a **ping-pong pattern**.
 
-While the compute stream processes the block currently stored in one buffer,
-the communication stream asynchronously fetches the next block into the other
-buffer.
+While the compute stream processes the block stored in one buffer, the communication
+stream asynchronously fetches the next block into the other buffer.
 
 ```text
                   time ─────────────────────────────────────────►
@@ -959,7 +982,7 @@ $\boxed{
 
 ---
 
-### Expected Performance Effect
+#### Expected Performance Effect
 
 Without overlap:
 
@@ -983,7 +1006,7 @@ T_{\text{computation}}
 T_{\text{pipeline overhead}}$
 
 
-Therefore, part of the communication latency can be **hidden behind useful GPU
+Consequently, part of the communication latency can be **hidden behind useful GPU
 computation**.
 
 Conceptually:
