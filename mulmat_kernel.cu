@@ -1,3 +1,15 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <mpi.h>
+#include <nccl.h>
+#include <nvshmem.h>
+#include <nvshmemx.h>
+
 ////////////////////////////////////////////////////////////////////////////////
 // Matrix multiplication CUDA kernels
 ////////////////////////////////////////////////////////////////////////////////
@@ -143,4 +155,172 @@ void ABMultiplyAccumulateAsync(const double *a, const double *b_chunk, double *c
     dim3 grid((n + w - 1) / w, (m + w - 1) / w);
     sharedABMultiplyAccumulate<<<grid, block, 2 * w * w * sizeof(double), stream>>>(a, b_chunk, c, m, n, k_total, k_offset, k_chunk,
                                                                                     lda, ldb, ldc, w);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// validate_C_kernel
+////////////////////////////////////////////////////////////////////////////////
+
+
+__global__ void validate_C_kernel(const double *C,
+                       size_t num_elements,
+                       double expected,
+                       double abs_tol,
+                       double rel_tol,
+                       unsigned long long *error_count,
+                       double *max_abs_error,
+                       double *max_rel_error)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx >= num_elements)
+        return;
+
+    double value = C[idx];
+    double abs_error = fabs(value - expected);
+    double rel_error = 0.0;
+
+    if (fabs(expected) > 0.0)
+        rel_error = abs_error / fabs(expected);
+
+    if ((abs_error > abs_tol) && (rel_error > rel_tol))
+        atomicAdd(error_count, 1ULL);
+
+    unsigned long long *addr_abs = (unsigned long long *)max_abs_error;
+    unsigned long long old_abs = *addr_abs;
+    unsigned long long assumed_abs;
+
+    do
+    {
+        assumed_abs = old_abs;
+
+        if (__longlong_as_double(assumed_abs) >= abs_error)
+            break;
+
+        old_abs = atomicCAS(addr_abs,
+                            assumed_abs,
+                            __double_as_longlong(abs_error));
+
+    } while (assumed_abs != old_abs);
+
+    unsigned long long *addr_rel = (unsigned long long *)max_rel_error;
+    unsigned long long old_rel = *addr_rel;
+    unsigned long long assumed_rel;
+
+    do
+    {
+        assumed_rel = old_rel;
+
+        if (__longlong_as_double(assumed_rel) >= rel_error)
+            break;
+
+        old_rel = atomicCAS(addr_rel,
+                            assumed_rel,
+                            __double_as_longlong(rel_error));
+
+    } while (assumed_rel != old_rel);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// validate_matrix_C function
+////////////////////////////////////////////////////////////////////////////////
+
+int validate_matrix_C(const double *d_C,
+                      int rows,
+                      int cols,
+                      double expected,
+                      double abs_tol,
+                      double rel_tol,
+                      int rank)
+{
+    size_t num_elements = (size_t)rows * (size_t)cols;
+
+    unsigned long long *d_error_count;
+    double *d_max_abs_error;
+    double *d_max_rel_error;
+
+    cudaMalloc((void **)&d_error_count, sizeof(unsigned long long));
+    cudaMalloc((void **)&d_max_abs_error, sizeof(double));
+    cudaMalloc((void **)&d_max_rel_error, sizeof(double));
+
+    cudaMemset(d_error_count, 0, sizeof(unsigned long long));
+    cudaMemset(d_max_abs_error, 0, sizeof(double));
+    cudaMemset(d_max_rel_error, 0, sizeof(double));
+
+    const int threads = 256;
+    size_t blocks = (num_elements + threads - 1) / threads;
+
+    validate_C_kernel<<<blocks, threads>>>(d_C,
+                                           num_elements,
+                                           expected,
+                                           abs_tol,
+                                           rel_tol,
+                                           d_error_count,
+                                           d_max_abs_error,
+                                           d_max_rel_error);
+
+    cudaError_t err = cudaGetLastError();
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr,
+                "Rank %d: validation kernel error: %s\n",
+                rank,
+                cudaGetErrorString(err));
+
+        cudaFree(d_error_count);
+        cudaFree(d_max_abs_error);
+        cudaFree(d_max_rel_error);
+        return 0;
+    }
+
+    cudaDeviceSynchronize();
+
+    unsigned long long error_count = 0;
+    double max_abs_error = 0.0;
+    double max_rel_error = 0.0;
+
+    cudaMemcpy(&error_count,
+               d_error_count,
+               sizeof(unsigned long long),
+               cudaMemcpyDeviceToHost);
+
+    cudaMemcpy(&max_abs_error,
+               d_max_abs_error,
+               sizeof(double),
+               cudaMemcpyDeviceToHost);
+
+    cudaMemcpy(&max_rel_error,
+               d_max_rel_error,
+               sizeof(double),
+               cudaMemcpyDeviceToHost);
+
+    if (rank == 0)
+    {
+        printf("\n");
+        printf("============================================================\n");
+        printf("NUMERICAL VALIDATION\n");
+        printf("============================================================\n");
+        printf("Matrix dimensions  : %d x %d\n", rows, cols);
+        printf("Expected C[i,j]    : %.12f\n", expected);
+        printf("Elements checked   : %llu\n", (unsigned long long)num_elements);
+        printf("Invalid elements   : %llu\n", error_count);
+        printf("Max absolute error : %.6e\n", max_abs_error);
+        printf("Max relative error : %.6e\n", max_rel_error);
+        printf("Absolute tolerance : %.6e\n", abs_tol);
+        printf("Relative tolerance : %.6e\n", rel_tol);
+
+        if (error_count == 0)
+            printf("Result             : PASS\n");
+        else
+            printf("Result             : FAIL\n");
+
+        printf("============================================================\n");
+    }
+
+    cudaFree(d_error_count);
+    cudaFree(d_max_abs_error);
+    cudaFree(d_max_rel_error);
+
+    return (error_count == 0);
 }

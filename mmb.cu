@@ -1,9 +1,59 @@
+/******************************************************************************
+ *
+ * Distributed Multi-GPU Matrix Multiplication Benchmark
+ *
+ * Description:
+ *   Distributed matrix multiplication benchmark for evaluating different
+ *   communication libraries in multi-GPU systems.
+ *
+ *   Supported communication libraries. The three-character argument specifies the communication library used
+ *   by the benchmark. For example:
+ *
+ *     MMM = MPI
+ *     CCC = CUDA-Aware MPI
+ *     NNN = NCCL
+ *     SSS = NVSHMEM
+ *
+ * Compilation:
+ *
+ *   [murilo.boratto@sdumont]$ make
+ *
+ * Execution:
+ *
+ *   Example using one node with four GPUs and one MPI process per GPU:
+ *
+ *   [murilo.boratto@sdumont]$ mpirun -np 1 ./mmb 0 2048 MMM \
+ *                                  : -np 1 ./mmb 1 2048 MMM \
+ *                                  : -np 1 ./mmb 2 2048 MMM \
+ *                                  : -np 1 ./mmb 3 2048 MMM
+ *
+ *   Arguments:
+ *
+ *    ./mmb <device_id> <matrix_size> <libraries>
+ *
+ *   where:
+ *
+ *     device_id    = CUDA GPU device assigned to the MPI process
+ *     matrix_size  = matrix dimension (e.g., 2048)
+ *     libraries    = communication library combination (MMM, CCC, NNN, SSS)
+ *
+ *   In the example above:
+ *
+ *     MPI Rank 0 -> GPU 0
+ *     MPI Rank 1 -> GPU 1
+ *     MPI Rank 2 -> GPU 2
+ *     MPI Rank 3 -> GPU 3
+ *
+ *   Therefore, four MPI processes are launched, each associated with one
+ *   NVIDIA GPU.
+ *
+ ******************************************************************************/
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <mpi.h>
@@ -57,6 +107,8 @@ static void prefetch_B_chunk(double *dst,
     }
 }
 
+extern int validate_matrix_C(const double *d_C, int rows, int cols, double expected, double abs_tol, double rel_tol, int rank);
+
 extern void ABMultiply(double *a, double *b, double *c, int m, int n, int k, int lda, int ldb, int ldc, int w);
 
 extern void ABMultiplyAccumulateAsync(const double *a, const double *b_chunk, double *c,
@@ -68,7 +120,7 @@ static int valid_library(char c)
     return c == 'M' || c == 'C' || c == 'N' || c == 'S';
 }
 
-/*****************************************************************************/
+/************************************************************************************************/
 
 int main(int argc, char *argv[])
 {
@@ -548,6 +600,21 @@ int main(int argc, char *argv[])
 
     if (myRank == 0)
         printf("\n\nmmb myRank=%d\tLibraries=%s\t RESULT: Matrix size: %d\tTime (seconds): %8.3f\n\n", myRank, communication_libraries, matrix_size, avg_time_per_transfer);
+
+    /* ------------------------------------------------------------------ */
+    /* Numerical validation of the final matrix C on rank 0.              */
+    /* A[i,j] = 1 and B[i,j] = 2, therefore C[i,j] = 2 * matrix_size.     */
+    /* ------------------------------------------------------------------ */
+
+    if (myRank == 0)
+    {
+        const double *validation_C = (libC == 'S') ? s_C : d_C;
+        const double expected_C = 2.0 * (double)k;
+        const double abs_tol = 1.0e-9;
+        const double rel_tol = 1.0e-12;
+
+        validate_matrix_C(validation_C, m, n, expected_C, abs_tol, rel_tol, myRank);
+    }
 
     /* ------------------------------------------------------------------ */
     /* Cleanup: free only buffers that were actually allocated.           */
