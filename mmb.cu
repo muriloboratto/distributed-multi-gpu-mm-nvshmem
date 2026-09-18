@@ -16,6 +16,8 @@
  *
  * Compilation:
  *
+ *   [murilo.boratto@sdumont]$ module load nvshmem/3.1.7_cuda-11.2_sequana
+ *
  *   [murilo.boratto@sdumont]$ make
  *
  * Execution:
