@@ -558,7 +558,7 @@ int main(int argc, char *argv[])
         }
 
         /* ================================================================ */
-        /* C: collect partial results                                        */
+        /* C: collect partial results                                       */
         /* ================================================================ */
         switch (libC) 
         {
